@@ -1,0 +1,575 @@
+---
+title: "FOI_data"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+date: "2024-01-28"
+---
+
+# Load necessary libraries
+```{r}
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(survival)
+library(splines)
+library(splines)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(readr)
+library(purrr)
+library(tidyr)
+library(gridExtra)
+
+## ============================================================
+## Set data directory
+## ============================================================
+DATA_DIR <- "PATH_TO_DATA_DIRECTORY"
+## Read the surveillance (FoI) data
+FOI_data <- readRDS(
+  file.path(DATA_DIR, "model_run_2021_11_12",
+            "Fred Hutch IHME COVID-19 US County Projections.rds")
+)
+FOI_data <- FOI_data[FOI_data$INC_TYPE == "foi", ]
+
+## Read P3003 site list (Excel, sheet 2)
+P3003_sitelist <- readxl::read_excel(
+  file.path(DATA_DIR, "VAC31518COV3001_Site_City_State_List_Global_15Sept22_Final.xlsx"),
+  sheet = 2
+)
+
+## Read P3003 trial data
+P3003_data <- read.csv(
+  file.path(DATA_DIR, "P3003_PartABlindedPhase_PrimaryEfficacyData.csv")
+)
+
+## Set the endpoint and cohort
+P3003_data <- dplyr::filter(
+  P3003_data,
+  SBD28FL != "Y",
+  ANL03FL == "Y",
+  PPEFL == "Y",
+  PARAMCD == "MODSEV"
+)
+```
+
+```{r, error=TRUE}
+# eve_ind and group num allign with paper, 19113 18924; 433, 883 T:\covpn\p300x_CrossProtocol\docs\BlindedPhasePublications\Final Analysis of Efficacy and Safety of Single-Dose Ad26.COV2.S.
+
+#CNSR: 1 = censored, 0 = event, restrictions follow the P3003 dictionary
+
+eve_ind<-P3003_data$CNSR==0
+
+table(P3003_data$TRT01P,eve_ind)
+
+eve_count <- P3003_data%>%
+  filter(eve_ind == 1) %>%     
+  group_by(TRT01P ) %>%  
+    summarise(Count = n())
+print(eve_count)
+
+#316 events in USA
+eve_count_COUNTRY<- P3003_data%>%
+   group_by(COUNTRY, TRT01P) %>% 
+  summarise(
+    Participants = n_distinct(SUBJID), 
+    Event_Count = sum(CNSR==0, na.rm = TRUE)  
+  )
+
+print(eve_count_COUNTRY)
+```
+
+```{r,error=TRUE}
+Analyze_data <- P3003_data %>%
+  filter(!(COUNTRY %in% c("BRA", "ZAF")))
+table(Analyze_data$AGEGR1,Analyze_data$TRT01P)
+table(Analyze_data$SEX,Analyze_data$TRT01P)
+table(Analyze_data$RACE,Analyze_data$TRT01P)
+```
+
+```{r, error=TRUE}
+#set the placebo group as the reference level
+trt_ind<- P3003_data$TRT01P  # 1 = "Ad26.COV2.S 5x10^10 vp",2 = "Placebo"
+trt_ind <- relevel(as.factor(trt_ind), ref = "Placebo")
+
+cox_model<-coxph(Surv(P3003_data$AVAL, eve_ind) ~ trt_ind +P3003_data$AGEGR1+P3003_data$RACE)
+summary(cox_model)
+cox_zph <- cox.zph(cox_model)
+cox_zph
+```
+
+```{r, error=TRUE}
+##link the SITEID(P3003_data)-Site #(P3003_sitelist)-County(P3003_sitelist)-location name(FOI)there are 209 sites and 8 countries in total in P3003.
+length(unique(P3003_data$COUNTRY))
+length(unique(P3003_data$SITEID))
+
+##In US, 17492 subjects in total, 112 sites
+P3003_data_US <- P3003_data %>%
+  filter(COUNTRY == "USA")
+length(unique(P3003_data_US$SITEID))
+
+#join P3003_data_US with P3003_sitelist, 210 site# in P3003_sitelist
+merged_data_sitelist <- P3003_data_US %>%
+  left_join(P3003_sitelist, by = c("SITEID" = "Site #"))
+#all 112 sites can be linked with a county name, 73 diff counties in total
+unique_all_county <- unique(merged_data_sitelist  [, c( "County", "State")])
+
+count_matched_site<- merged_data_sitelist %>%
+  filter(!is.na(County)) %>%
+  summarize(count = n_distinct(SITEID)) %>%
+  pull(count)
+```
+
+```{r, error=TRUE}
+##link each individual to the FOI data, from start to end date,
+FOI_data <- FOI_data %>%
+  mutate(location_name = dplyr::recode(location_name,
+      "New York Metropolitan Area" = "New York",
+     "Calcasieu Parish" = "Calcasieu",
+      "Ouachita Parish" = "Ouachita"))
+
+county_siteid_counts <- merged_data_sitelist %>%
+  group_by(County) %>%
+  summarise(unique_siteid_count = n_distinct(SITEID))
+
+FOI_duplicates <- FOI_data %>%
+  group_by(location_name, Date) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+dupli_county<-FOI_duplicates %>%
+  distinct(location_name, parent_location_name)
+
+#here the length of FOI_non dupli+FOI_duplicated does not equal to FOI because the dupli county does not has the exact same dates, 
+FOI_non_duplicates <- FOI_data %>%
+  anti_join(FOI_duplicates, by = c("location_name"))
+
+merged_data_no_duplicates <- merged_data_sitelist %>%
+  left_join(FOI_non_duplicates, by = c("County" = "location_name"),relationship = "many-to-many")
+
+#for the duplicate counties, need to identify further by state
+merged_data_duplicates <- merged_data_sitelist %>%
+  left_join(FOI_duplicates, by = c("County" = "location_name", "State" = "parent_location_name"),relationship = "many-to-many")
+
+merged_data_with_foi <- bind_rows(merged_data_duplicates, merged_data_no_duplicates)
+
+rm(merged_data_duplicates)
+
+rm(merged_data_no_duplicates)
+```
+
+```{r,error=TRUE}
+# Separate the ones connect to county(Match_county) and not(Match_state),11169 can connect to county
+Match_county <- merged_data_with_foi %>%
+  group_by(SUBJID) %>%
+  filter(n() > 2) %>%
+  ungroup()
+
+Match_county%>%
+  filter(CNSR == 0) %>%
+  distinct(SUBJID, TRT01P) %>%
+  count(TRT01P)
+
+unique_connect_county <- unique(Match_county [, c( "County", "State")])
+
+# Save as CSV
+write.csv(unique_connect_county, "unique_connect_county.csv", row.names = FALSE)
+
+table(unique(Match_county[c("SUBJID", "TRT01P")])$TRT01P)
+
+
+##12646, 6323 subject not conect to county,(this duplicate because all merged_data_sitelist)
+Match_state <- merged_data_with_foi %>%
+  group_by(SUBJID) %>%
+  filter(n() == 2) %>%
+  ungroup()
+
+table(unique(Match_state [c("SUBJID", "TRT01P")])$TRT01P)
+
+#the ones connet using state data, there are 109 and 31 event in placebo and trt group
+Match_state %>%
+  filter(CNSR == 0) %>%
+  distinct(SUBJID, TRT01P) %>%
+  count(TRT01P)
+
+Match_state_subjids <- Match_state %>%
+  distinct(SUBJID) %>%
+  pull(SUBJID)  # 
+
+merged_data_sitelist_state<-merged_data_sitelist %>%
+  filter(SUBJID %in% Match_state_subjids )
+
+#change the oregon to Oregon
+merged_data_sitelist_state$State[merged_data_sitelist_state$State == "oregon"] <- "Oregon"
+
+merged_data_with_foi_state <- merged_data_sitelist_state%>%
+  left_join(FOI_data, by = c( "State" = "location_id"),relationship = "many-to-many")
+
+#all have connect to state
+single_row_subjects <- merged_data_with_foi_state %>%
+  group_by(SUBJID) %>% 
+  tally() %>%                    # Count rows for each SUBJID
+  filter(n == 1)   
+
+##length(unique(Match_county$SUBJID))=11169, connect to county; length(unique(merged_data_with_foi_state$SUBJID)) 6323 connect to state; overall 17492 individuals (US)
+merged_data_foi_all<-bind_rows(Match_county, merged_data_with_foi_state)
+
+length(unique(merged_data_with_foi_state$SUBJID))
+
+rm(Match_county)
+
+rm(merged_data_with_foi_state)
+##only keep the one with non
+#NA,mean
+Match_data_with_foi <- merged_data_foi_all %>%
+ filter(!is.na(mean))
+
+```
+
+```{r, error=TRUE}
+#only keep the data within the start and end date
+#STARTDT=ARFSTDT, analysis reference start date.
+start_date = as.Date(Match_data_with_foi$STARTDT,format = "%d%b%Y")+14
+end_date <-  as.Date(Match_data_with_foi$ADT,format = "%d%b%Y")
+time_origin <-as.Date("2020-07-01")
+max(end_date)
+
+#take the connected dataset within study period
+merged_foi_within <- subset(Match_data_with_foi, as.Date(Date) >= start_date & as.Date(Date) <= end_date)
+
+#sum(merged_foi_within$eve_ind)=205
+merged_foi_within$eve_ind<-(1-merged_foi_within$CNSR)*(as.Date(merged_foi_within$Date)==dmy(merged_foi_within$ADT))
+
+event_within_table <- table(merged_foi_within$TRT01P, merged_foi_within$eve_ind)
+
+
+##in the dataset, there are 1 sex unknown, 5 undifferentiated, for the linked data, only 1 undifferentiated, romove this one,
+
+merged_foi_within <- merged_foi_within[!(merged_foi_within$SEX %in% c("UNDIFFERENTIATED", "U")), ]
+# check duplicates by grouping by subject_id and date
+duplicates <- merged_foi_within %>%
+  group_by(SUBJID, Date) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+merged_foi_within$force_1000<-merged_foi_within$mean*1000
+
+
+
+#calculate the median of follow up time in vaccine group of the connected dataset
+median_aval_trt <- merged_foi_within %>%
+  filter(TRT01P == "Ad26.COV2.S 5x10^10 vp") %>%       
+  distinct(SUBJID,AVAL) %>%         
+  summarise(median_AVAL= median(AVAL), unique_SUBJID_count = n_distinct(SUBJID))  
+
+median_aval_placebo <- merged_foi_within %>%
+  filter(TRT01P =="Placebo"  ) %>%       
+  distinct(SUBJID,AVAL) %>%         
+  summarise(median_AVAL= median(AVAL), unique_SUBJID_count = n_distinct(SUBJID))  
+
+##take "2020-07-01" as reference date, calculate start and end date in Calendar
+merged_foi_within$end_Calendar=as.Date(merged_foi_within$Date)-time_origin+1
+merged_foi_within$start_Calendar = merged_foi_within$end_Calendar -1
+
+merged_foi_within$trt_within_Ad26 <- ifelse(merged_foi_within$TRT01P == "Ad26.COV2.S 5x10^10 vp", 1, 0)
+
+merged_foi_within$time_since_vaccination <- difftime(as.Date(merged_foi_within$Date),                      (as.Date(merged_foi_within$STARTDT,format = "%d%b%Y")),units = "days")
+
+merged_foi_within$AGEGR1 <- as.factor(merged_foi_within$AGEGR1)
+merged_foi_within$AGEGR1 <- relevel(merged_foi_within$AGEGR1, ref = "18-59 years")
+
+#check the dataset
+subjects_with_event <- unique(merged_foi_within$SUBJID[merged_foi_within$eve_ind==1])
+
+subject1 <- subjects_with_event[1]
+
+subset_with_event <- merged_foi_within[merged_foi_within$SUBJID == subject1,]
+
+##how many participants linked to the foi
+connect_num<- merged_foi_within %>%
+  group_by(TRT01P) %>%
+  summarise(
+    unique_subjects = n_distinct(SUBJID),
+    total_events = sum(eve_ind, na.rm = TRUE)
+  )
+```
+
+```{r,error=TRUE}
+
+summary(merged_foi_within$force_1000)
+
+model_vac<- coxph(Surv(as.numeric(start_Calendar), as.numeric(end_Calendar), eve_ind) ~ 
+                 AGEGR1 + SEX + RACEGR1 +
+                 trt_within_Ad26 *force_1000+trt_within_Ad26:time_since_vaccination,
+               data = merged_foi_within)
+summary(model_vac)
+
+V_US_vac <-  stats::vcov(model_vac) 
+print(V_US_vac)
+
+
+model_US_final<- coxph(Surv(as.numeric(start_Calendar), as.numeric(end_Calendar), eve_ind) ~ 
+                 AGEGR1 + SEX + RACEGR1 +
+                force_1000+ trt_within_Ad26,
+               data = merged_foi_within)
+
+summary(model_US_final)
+
+V_US_final <-  stats::vcov(model_US_final) 
+print(V_US_final)
+
+
+test_US_final <- cox.zph(model_US_final,transform = "identity")
+
+print(test_US_final)
+
+plot_vars <- rownames(test_US_final$table)
+plot_vars <- plot_vars[!(plot_vars %in% c("GLOBAL",  "force_1000"))]
+# Custom readable labels
+custom_labels <- c(
+  "AGEGR1" = "Age",
+  "SEX" = "Sex",
+   "RACEGR1"  = "Race",
+  "trt_within_Ad26" = "Treatment Group"
+)
+
+
+y_breaks_list <- list(
+  "Age" = seq(-6, 6, by = 3),
+  "Sex" = seq(-4, 4, by = 2),
+  "Race" = seq(-15, 15, by = 10),
+  "Treatment Group"  = seq(-6, 6, by = 3)
+)
+
+ylims <- list(
+  "Age" = c(-6, 6),
+  "Sex" = c(-4, 4),
+  "Race" = c(-15,15),
+  "Treatment Group" = c(-6, 6)
+)
+
+# Define x-axis limits and breaks (based on full time range in days)
+xlims <- range(unlist(test_US_final$x))
+x_breaks <- seq(floor(xlims[1]), ceiling(xlims[2]), by = 30)  # adjust "by" for spacing
+x_breaks <- x_breaks[x_breaks >= xlims[1] & x_breaks <= xlims[2]]
+
+png("US_res_3003.png", width = 1200, height = 800, res = 150)
+par(mfrow = c(2, 2),             
+    mar = c(5, 5, 2, 1),      
+    oma = c(0.5, 0.5,0.5,0.5)) 
+
+# Order of variables to plot
+for (i in seq_along(plot_vars)) {
+  var <- plot_vars[i]
+  
+  if (!(var %in% names(custom_labels))) {
+    cat("Skipping:", var, "- no matching label in custom_labels\n")
+    next
+  }
+  
+  label <- custom_labels[[var]]
+  
+  # Additional safety checks
+  if (!(label %in% names(ylims)) || !(label %in% names(y_breaks_list))) {
+    cat("Skipping:", var, "- missing ylim or y_breaks for label:", label, "\n")
+    next
+  }
+
+  cat("Plotting:", var, "as", label, "\n")
+  
+  plot(test_US_final, var = i,
+       main = label, ylab = "", xlab = "",
+       ylim = ylims[[label]], xlim = xlims,
+       xaxt = "n", yaxt = "n", frame.plot = FALSE)
+  
+  axis(1, at = x_breaks, labels = x_breaks, cex.axis = 0.8)
+  axis(2, at = y_breaks_list[[label]], cex.axis = 0.8)
+  box()
+
+  mtext("Schoenfeld Residuals", side = 2, line = 2.5, cex = 0.8)
+  mtext("Time", side = 1, line = 2.4, cex = 0.8)
+}
+
+dev.off()
+
+```
+
+```{r,error=TRUE}
+country_names<- c("Colombia", "Brazil", "Argentina","Mexico","Peru","Chile")
+
+country_locations <- FOI_data %>%
+  filter(parent_location_name %in% country_names) %>%
+  distinct(parent_location_name, location_name)
+
+P3003_COL=P3003_data %>%
+  filter(COUNTRY=="COL")
+
+table(P3003_COL$TRT01P,P3003_COL$CNSR==0)
+
+ merged_COL_sitelist <- P3003_COL %>%
+   left_join(P3003_sitelist , by = c("SITEID" = "Site #"))
+
+
+CoL_Country_mapping <- data.frame(
+  COUNTRY = c("COL"),
+  full_country_name = c("Colombia")
+)
+
+merged_COL_sitelist<- merged_COL_sitelist %>%
+  left_join(CoL_Country_mapping , by = c("COUNTRY" = "COUNTRY"))
+
+merged_COL_foi <- merged_COL_sitelist%>%
+  left_join(FOI_data, by = c("full_country_name" = "location_id"),relationship = "many-to-many")
+
+
+#take the connected dataset within study period
+merged_COL_within <- subset(merged_COL_foi, as.Date(Date) >= (as.Date(merged_COL_foi$STARTDT,format = "%d%b%Y")+14 )& as.Date(Date) <= as.Date(merged_COL_foi$ADT,format = "%d%b%Y"))
+
+```
+
+```{r,error=TRUE}
+#for location_id==Mexico, the foi is na, assign the mean of all parent_location_name is mexico to it,
+mean_parent_mexico <- FOI_data %>%
+  filter(parent_location_name == "Mexico") %>%
+  group_by(Date) %>%
+  summarise(parent_mean = mean(mean, na.rm = TRUE))
+
+FOI_data <- FOI_data %>%
+  left_join(mean_parent_mexico, by = "Date") %>%
+  mutate(mean = ifelse(location_id == "Mexico" & is.na(mean), parent_mean, mean)) %>%
+  select(-parent_mean) 
+
+
+P3003_CPAM=P3003_data %>%
+  filter(COUNTRY %in% c("PER", "CHL", "MEX", "ARG"))
+
+merged_CPAM_sitelist <- P3003_CPAM%>%
+  left_join(P3003_sitelist , by = c("SITEID" = "Site #"))
+
+CPAM_Country_mapping <- data.frame(
+  COUNTRY = c("PER", "ARG", "CHL", "MEX"),
+  full_country_name = c("Peru", "Argentina", "Chile", "Mexico")
+)
+
+merged_CPAM_sitelist  <- merged_CPAM_sitelist %>%
+  left_join(CPAM_Country_mapping , by = c("COUNTRY" = "COUNTRY"))
+
+
+merged_CPAM_foi <- merged_CPAM_sitelist %>%
+  left_join(FOI_data, by = c("full_country_name" = "location_id"),relationship = "many-to-many")
+
+#take the connected dataset within study period
+merged_CPAM_within <- subset(merged_CPAM_foi , as.Date(Date) >= (as.Date(merged_CPAM_foi $STARTDT,format = "%d%b%Y")+14 )& as.Date(Date) <= as.Date(merged_CPAM_foi $ADT,format = "%d%b%Y"))
+
+merged_Latin_within <-bind_rows(merged_COL_within, merged_CPAM_within)
+
+merged_Latin_within$eve_ind<-(1-merged_Latin_within$CNSR)*(as.Date(merged_Latin_within$Date)==dmy(merged_Latin_within$ADT))
+
+
+merged_Latin_within$force_1000<-merged_Latin_within$mean*1000
+
+##take "2020-07-01" as reference date, calculate start and end date in Calendar
+merged_Latin_within$end_Calendar=as.Date(merged_Latin_within$Date)-time_origin+1
+merged_Latin_within$start_Calendar = merged_Latin_within$end_Calendar -1
+
+merged_Latin_within$trt_within_Ad26 <- ifelse(merged_Latin_within$TRT01P == "Ad26.COV2.S 5x10^10 vp", 1, 0)
+
+merged_Latin_within$time_since_vaccination <- difftime(as.Date(merged_Latin_within$Date),                      (as.Date(merged_Latin_within$STARTDT,format = "%d%b%Y")),units = "days")
+
+ merged_Latin_within$AGEGR1 <- as.factor(merged_Latin_within$AGEGR1)
+merged_Latin_within$AGEGR1 <- relevel(merged_Latin_within$AGEGR1, ref = "18-59 years")
+
+merged_Latin_within = merged_Latin_within[merged_Latin_within$SEX != "UNDIFFERENTIATED",]
+summary(merged_Latin_within$force_1000)
+
+```
+
+```{r,error=TRUE}
+selected_Latin <- merged_Latin_within %>%
+  select(start_Calendar, end_Calendar, eve_ind,AGEGR1,SEX,RACEGR1,trt_within_Ad26,force_1000,time_since_vaccination,REGION1)
+
+selected_US<- merged_foi_within %>%
+  select(start_Calendar, end_Calendar, eve_ind,AGEGR1,SEX,RACEGR1,trt_within_Ad26,force_1000,time_since_vaccination,REGION1)
+
+# Combine the datasets (stack rows)
+combined_data <- bind_rows(selected_Latin, selected_US)
+
+rm(merged_Latin_within)
+rm(merged_foi_within)
+summary(combined_data$force_1000)
+
+model_combine_final<- coxph(Surv(as.numeric(start_Calendar), as.numeric(end_Calendar), eve_ind) ~
+                 AGEGR1 + SEX+ RACEGR1+
+                 trt_within_Ad26 *force_1000+trt_within_Ad26:time_since_vaccination,
+               data =combined_data)
+
+summary(model_combine_final)
+
+V_combine_final <-  stats::vcov(model_combine_final) 
+print(V_combine_final)
+
+
+```
+
+```{r,error=TRUE}
+test_combine_final <- cox.zph(model_combine_final,transform="identity")
+
+print(test_combine_final)
+
+plot_vars <- rownames(test_combine_final$table)
+plot_vars <- plot_vars[!(plot_vars %in% c("GLOBAL","trt_within_Ad26",  "force_1000","trt_within_Ad26:force_1000","trt_within_Ad26:time_since_vaccination"))]
+# Custom readable labels
+custom_labels <- c(
+  "AGEGR1" = "Age",
+  "SEX" = "Sex",
+   "RACEGR1"  = "Race")
+
+y_breaks_list <- list(
+  "Age" = seq(-10, 10, by = 5),
+  "Sex" = seq(-4, 4, by = 2),
+  "Race" = seq(-20, 30, by = 10))
+
+ylims <- list(
+  "Age" = c(-10, 10),
+  "Sex" = c(-4, 4),
+  "Race" = c(-20,30)
+)
+
+# Define x-axis limits and breaks (based on full time range in days)
+xlims <- range(unlist(test_combine_final$x))
+x_breaks <- seq(floor(xlims[1]), ceiling(xlims[2]), by = 30)  # adjust "by" for spacing
+x_breaks <- x_breaks[x_breaks >= xlims[1] & x_breaks <= xlims[2]]
+
+png("combine_res_3003.png", width = 1200, height = 800, res = 150)
+par(mfrow = c(2,2),             
+    mar = c(5, 5, 2, 1),      
+    oma = c(0.5, 0.5,0.5,0.5)) 
+
+# Order of variables to plot
+for (i in seq_along(plot_vars)) {
+  var <- plot_vars[i]
+  label <- custom_labels[[var]]
+  if (is.null(label)) next  # skip if label not defined
+  
+  plot(test_combine_final, var = i,
+       main = label, ylab = "", xlab = "",
+       ylim = ylims[[label]], xlim = xlims,
+       xaxt = "n", yaxt = "n", frame.plot = FALSE)
+  
+  # Add custom axes and frame
+  axis(1, at = x_breaks, labels = x_breaks, cex.axis = 0.8)
+  axis(2, at = y_breaks_list[[label]], cex.axis = 0.8)
+  box()
+
+  # Axis labels
+  mtext("Schoenfeld Residuals", side = 2, line = 2.5, cex = 0.8)
+  mtext("Time ", side = 1, line = 2.4, cex = 0.8)
+}
+
+dev.off()
+
+
+```
+

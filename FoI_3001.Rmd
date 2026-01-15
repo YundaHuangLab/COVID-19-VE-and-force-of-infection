@@ -1,0 +1,349 @@
+---
+title: "FOI_P3001"
+output: html_document
+date: "2025-01-30"
+---
+
+# Load necessary libraries
+```{r}
+library(readxl)
+library(lubridate)
+library(ggplot2)
+library(survival)
+library(splines)
+library(splines)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(gridExtra)
+
+## ============================================================
+## Set data directory 
+## ============================================================
+DATA_DIR <- "PATH_TO_DATA_DIRECTORY"
+
+## Trial data
+P3001_data <- read.csv(
+  file.path(DATA_DIR, "P3001_BlindedPhasePartA_PrimaryEfficacyData.csv")
+)
+
+## set the endpoint and cohort
+P3001_data <- dplyr::filter(P3001_data, PARAMCD == "TTCVDC1", PPROTFL == "Y")
+
+## overall, all sites are in USA and we have 99 sites.
+length(unique(P3001_data$SITEID[P3001_data$COUNTRY == "USA"]))
+
+## read the surveillance data
+FOI_data <- readRDS(
+  file.path(DATA_DIR,
+            "Fred Hutch IHME COVID-19 US County Projections.rds")
+)
+FOI_data <- FOI_data[FOI_data$INC_TYPE == "foi", ]
+
+## read the sitelist
+P3001_sitelist <- read.csv(
+  file.path(DATA_DIR, "study_siteid_sitename_updated.csv")
+)
+
+P3001_sitelist <- P3001_sitelist %>%
+  dplyr::filter(STUDYID == "mRNA-1273-P301")
+
+```
+
+```{r}
+event_time<-P3001_data$AVAL
+censor_ind<-1-P3001_data$CNSR
+sum(censor_ind)
+trt_ind<-P3001_data$TRT01PN  # "1" for placebo, "2" for mRNA
+## 14164, 14287, 744,55 allign with Paper 0m Per protocal
+table(P3001_data$TRT01PN,P3001_data$CNSR == 0)
+```
+
+```{r,error=TRUE}
+table(P3001_data$AGEGR1,P3001_data$TRT01P)
+table(P3001_data$SEX,P3001_data$TRT01P)
+table(P3001_data$RACE,P3001_data$TRT01P)
+```
+
+```{r}
+#fit the Cox proportional hazard models, VE=0.931
+cox_model <- coxph(Surv(event_time, censor_ind) ~ trt_ind, data = P3001_data)
+summary(cox_model)
+#check the proportional hazard assumption
+cox_zph <- cox.zph(cox_model)
+```
+
+```{r}
+## Link the SUBJID(P3002_data)-SITEID-COUNTY(sitelist)-location name(FOI)
+P3001_sitelist <- P3001_sitelist %>%
+  select(SITEID, County,State_long)
+#Join P3001_data with P3001_sitelist to get COUNTY
+merged_data_sitelist <- P3001_data %>%
+  left_join(P3001_sitelist, by = "SITEID")
+## 73 counties, with Hamilton in Tenness and Ohio, Orange in North Carolina and Florida, Orange florida not connect to county
+unique_county <- unique(merged_data_sitelist[, c("County", "State_long")])
+num_county<- nrow(unique_county)
+num_county
+
+merged_data_sitelist <- merged_data_sitelist%>%
+  mutate(County = gsub(" County", "", County))
+
+FOI_data<- FOI_data%>%
+  mutate(location_name = gsub(" County", "", location_name))
+
+## replace some location names in FOI
+FOI_data<- FOI_data %>%
+  mutate(location_name = dplyr::recode(location_name,
+     "Calcasieu Parish" = "Calcasieu",
+      "Ouachita Parish" = "Ouachita"))
+                           
+
+FOI_duplicates <- FOI_data %>%
+  group_by(location_name, Date) %>%
+  filter(n() > 1) %>%                    
+  ungroup()
+
+county_dup <- FOI_duplicates%>%
+  distinct(location_name, parent_location_name)
+
+
+merged_data_duplicates <- merged_data_sitelist %>%
+  left_join(FOI_duplicates, by = c("County" = "location_name", "State_long" = "parent_location_name"),relationship =
+  "many-to-many")
+
+##connect with the non duplicates data
+FOI_non_duplicates <- FOI_data %>%
+  anti_join(FOI_duplicates, by = "location_name") 
+
+merged_data_no_duplicates <- merged_data_sitelist %>%
+  left_join(FOI_non_duplicates, by = c("County" = "location_name"),relationship =
+  "many-to-many")
+
+merged_data_with_county <- bind_rows(merged_data_duplicates, merged_data_no_duplicates)
+
+rm(merged_data_duplicates)
+rm(merged_data_no_duplicates)
+
+Match_county <- merged_data_with_county  %>%
+  group_by(SUBJID) %>%
+  filter(n() > 2) %>%
+  ungroup()
+
+Match_county_subjids <- Match_county %>%
+  distinct(SUBJID) %>%
+  pull(SUBJID)  # 
+
+rm(Match_county)
+# 42 counties, 18504 subjects can be connect to FOI data, 9207 (452) and 9297(28)
+merged_data_sitelist_county <- merged_data_sitelist %>%
+  filter(SUBJID %in% Match_county_subjids )
+
+unique_connect_county <- unique(merged_data_sitelist_county[, c("County", "State_long")])
+
+# Save as CSV
+write.csv(unique_connect_county, "unique_connect_county.csv", row.names = FALSE)
+
+num_connect_county<- nrow(unique_connect_county )
+num_connect_county
+
+table( merged_data_sitelist_county$TRT01PN,merged_data_sitelist_county$CNSR==0)
+   
+
+Match_state <- merged_data_with_county %>%
+  group_by(SUBJID) %>%
+  filter(n() == 2) %>%
+  ungroup()
+
+Match_state_subjids <- Match_state %>%
+  distinct(SUBJID) %>%
+  pull(SUBJID)  # 
+
+rm(Match_state)
+
+merged_data_sitelist_state <- merged_data_sitelist %>%
+  filter(SUBJID %in% Match_state_subjids )
+
+#31 counties not connect to county, 4957(292) and 4990 (27)
+unique_noncon_county <- unique(merged_data_sitelist_state[, c("County", "State_long")])
+
+num_noncon_county<- nrow(unique_noncon_county )
+num_noncon_county
+
+table( merged_data_sitelist_state$TRT01PN,merged_data_sitelist_state$CNSR==0)
+
+merged_data_with_state <- merged_data_sitelist_state %>%
+  left_join(FOI_data, by = c( "State_long" = "location_id"),relationship = "many-to-many")
+
+```
+
+```{r}
+##filter the data within the study window of each subject
+merged_foi_within_county <- subset(merged_data_with_county, as.Date(Date) >= (dmy(merged_data_with_county$DOSE2DT)+days(14))& (as.Date(Date) <= dmy(merged_data_with_county$ADT)))
+
+rm(merged_data_with_county)
+
+merged_foi_within_state <- subset(merged_data_with_state, as.Date(Date) >= (dmy(merged_data_with_state$DOSE2DT)+days(14))& (as.Date(Date) <= dmy(merged_data_with_state$ADT)))
+
+rm(merged_data_with_state)
+
+#select columns and then combine them
+selected_columns <- c("mean", "DOSE2DT", "Date", "ADT", "TRT01P", "SEX", "CNSR", "AGEGR1", "RACE","SUBJID","County")
+
+# Select the columns in both datasets
+merged_foi_within_county_selected <- merged_foi_within_county[, selected_columns, drop = FALSE]
+merged_foi_within_state_selected <- merged_foi_within_state[, selected_columns, drop = FALSE]
+
+# Combine both datasets
+merged_foi_within <- rbind(merged_foi_within_county_selected, merged_foi_within_state_selected)
+
+rm(merged_foi_within_county)
+rm(merged_foi_within_state)
+
+time_origin =  "2020-08-01"
+merged_foi_within$start_Calendar=as.Date(merged_foi_within$Date)-as.Date(time_origin)
+
+merged_foi_within$end_Calendar=merged_foi_within$start_Calendar+1
+
+merged_foi_within$trt_within <- ifelse(merged_foi_within$TRT01P == "mRNA-1273", 1, 0)
+
+age_within<-merged_foi_within$AGEGR1
+
+merged_foi_within$RACEC <- ifelse(merged_foi_within$RACE == "WHITE", "White", "Communities of Color")
+
+merged_foi_within$RACEC <- factor(
+merged_foi_within$RACEC,
+  levels = c("White","Communities of Color" )
+)
+
+
+merged_foi_within$eve_ind<-(1-merged_foi_within$CNSR)*(as.Date(merged_foi_within$Date)==dmy(merged_foi_within$ADT))
+
+force_1000<-merged_foi_within$mean*1000
+
+summary(force_1000)
+
+date_within <- as.Date(merged_foi_within$Date, format = "%Y-%m-%d")
+DOSE2DT_within <- dmy(merged_foi_within$DOSE2DT)
+time_since_vaccination <- as.numeric(date_within-DOSE2DT_within)
+
+model_vac <- coxph(Surv(as.numeric(merged_foi_within$start_Calendar), 
+                      as.numeric(merged_foi_within$end_Calendar), 
+                      merged_foi_within$eve_ind) ~ 
+                  age_within +merged_foi_within$RACEC +merged_foi_within$SEX+  force_1000*merged_foi_within$trt_within+
+      time_since_vaccination:merged_foi_within$trt_within)
+
+summary(model_vac)
+
+V_vac<- stats::vcov(model_vac)       
+print(V_vac)
+
+
+test_vac <- cox.zph(model_vac)
+print(test_vac)
+png("vac_res.png", width = 1200, height = 1200, res = 150)
+par(mfrow = c(3, 3))
+plot(test_vac)
+dev.off()
+
+#remove time since vac
+model_vac_1 <- coxph(Surv(as.numeric(merged_foi_within$start_Calendar), 
+                      as.numeric(merged_foi_within$end_Calendar), 
+                      merged_foi_within$eve_ind) ~ 
+                  age_within +merged_foi_within$RACEC +merged_foi_within$SEX+  force_1000*merged_foi_within$trt_within)
+
+summary(model_vac_1)
+
+test_vac_1 <- cox.zph(model_vac_1)
+
+print(test_vac_1)
+
+png("vac_1_res.png", width = 1200, height = 800, res = 150)
+par(mfrow = c(2, 3))
+plot(test_vac_1)
+dev.off()
+
+## remove all non_sig
+model_vac_final <- coxph(Surv(as.numeric(merged_foi_within$start_Calendar), 
+                      as.numeric(merged_foi_within$end_Calendar), 
+                      merged_foi_within$eve_ind) ~ 
+                  age_within+merged_foi_within$SEX+merged_foi_within$RACEC +force_1000+merged_foi_within$trt_within)
+
+summary(model_vac_final)
+
+V_final <- stats::vcov(model_vac_final)       
+print(V_final)
+
+test_vac_2 <- cox.zph(model_vac_final,transform = "identity")
+print(test_vac_2)
+
+plot_vars <- rownames(test_vac_2$table)
+plot_vars <- plot_vars[!(plot_vars %in% c("GLOBAL", "force_1000"))]
+# Custom readable labels
+custom_labels <- c(
+  "age_within" = "Age",
+  "merged_foi_within$RACEC" = "Race",
+  "merged_foi_within$SEX" = "Sex",
+  "merged_foi_within$trt_within" = "Treatment Group"
+)
+
+png("vac_2_res.png", width = 1200, height = 800, res = 150)
+
+par(mfrow = c(2, 2),             
+    mar = c(5, 5, 2, 1),      
+    oma = c(0.5, 0.5,0.5,0.5))  
+
+# Get actual time range
+xlims <- range(test_vac_2$x)
+x_breaks <- seq(floor(xlims[1]), ceiling(xlims[2]), by = 20) 
+x_breaks <- x_breaks[x_breaks >= xlims[1] & x_breaks <= xlims[2]]
+
+
+ylims <- list(
+  "Age" = c(-5, 10),
+  "Race" = c(-5, 10),
+  "Sex" = c(-4, 4),
+  "Treatment Group" = c(-5, 15)
+)
+
+# Order of variables to plot
+for (i in seq_along(plot_vars)) {
+  var <- plot_vars[i]
+  plot(test_vac_2, var = i,
+       main = custom_labels[[var]],
+       ylab = "",
+       xlab = "",
+       ylim = ylims[[custom_labels[[var]]]],xlim=xlims,
+       xaxt = "n")               
+
+axis(1, at = x_breaks, labels = x_breaks, tick = TRUE, cex.axis = 0.8)
+
+  mtext("Schoenfeld Residuals", side = 2, line = 2.5, cex = 0.8)
+  mtext("Time", side = 1, line = 2.4, cex = 0.8, adj = 0.5)
+}
+
+dev.off()
+
+
+summary_counts <- merged_foi_within %>%
+  group_by(trt_within) %>%
+  summarise(
+    total_participants = n_distinct(SUBJID),      
+    total_events = sum(eve_ind) 
+  )
+summary_counts
+```
+
+```{r,error=TRUE}
+merged_foi_within$FUP = dmy(merged_foi_within$ADT)-(dmy(merged_foi_within$DOSE2DT))+1
+
+unique_fup_trt <- aggregate(FUP ~ SUBJID, data = merged_foi_within[merged_foi_within$TRT01P == "mRNA-1273", ], FUN = unique)
+
+median_follow <- median(unique_fup_trt$FUP, na.rm = TRUE)
+
+unique_fup_placebo <- aggregate(FUP ~ SUBJID, data = merged_foi_within[merged_foi_within$TRT01P == "Placebo", ], FUN = unique)
+
+median_follow_placebo <- median(unique_fup_placebo$FUP, na.rm = TRUE)
+
+median_follow
+median_follow_placebo
+```
